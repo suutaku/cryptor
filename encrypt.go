@@ -1,0 +1,136 @@
+package cryptor
+
+import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+
+	"golang.org/x/crypto/pbkdf2"
+	"golang.org/x/crypto/scrypt"
+)
+
+const (
+	// Scrypt parameters
+	scryptr      = 8
+	scryptp      = 1
+	scryptKeyLen = 32
+
+	// PBKDF2 parameters
+	pbkdf2KeyLen = 32
+	pbkdf2PRF    = "hmac-sha256"
+)
+
+// Encrypt encrypts data.
+func (e *Cryptor) Encrypt(secret []byte, passphrase string) (map[string]interface{}, error) {
+	if secret == nil {
+		return nil, errors.New("no secret")
+	}
+
+	// Random salt
+	salt := make([]byte, 32)
+	if _, err := rand.Read(salt); err != nil {
+		return nil, err
+	}
+
+	normedPassphrase := []byte(normPassphrase(passphrase))
+	// Create the decryption key
+	var decryptionKey []byte
+	var err error
+	switch e.cipher {
+	case "scrypt":
+		decryptionKey, err = scrypt.Key(normedPassphrase, salt, e.cost, scryptr, scryptp, scryptKeyLen)
+	case "pbkdf2":
+		decryptionKey = pbkdf2.Key(normedPassphrase, salt, e.cost, pbkdf2KeyLen, sha256.New)
+	default:
+		return nil, fmt.Errorf("unknown cipher %q", e.cipher)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// Generate the cipher message
+	cipherMsg := make([]byte, len(secret))
+	aesCipher, err := aes.NewCipher(decryptionKey[:16])
+	if err != nil {
+		return nil, err
+	}
+	// Random IV
+	iv := make([]byte, 16)
+	if _, err := rand.Read(iv); err != nil {
+		return nil, err
+	}
+	stream := cipher.NewCTR(aesCipher, iv)
+	stream.XORKeyStream(cipherMsg, secret)
+
+	// Generate the checksum
+	h := sha256.New()
+	if _, err := h.Write(decryptionKey[16:32]); err != nil {
+		return nil, err
+	}
+	if _, err := h.Write(cipherMsg); err != nil {
+		return nil, err
+	}
+	checksumMsg := h.Sum(nil)
+
+	var kdf *ksKDF
+	switch e.cipher {
+	case "scrypt":
+		kdf = &ksKDF{
+			Function: "scrypt",
+			Params: &ksKDFParams{
+				DKLen: scryptKeyLen,
+				N:     e.cost,
+				P:     scryptp,
+				R:     scryptr,
+				Salt:  hex.EncodeToString(salt),
+			},
+			Message: "",
+		}
+	case "pbkdf2":
+		kdf = &ksKDF{
+			Function: "pbkdf2",
+			Params: &ksKDFParams{
+				DKLen: pbkdf2KeyLen,
+				C:     e.cost,
+				PRF:   pbkdf2PRF,
+				Salt:  hex.EncodeToString(salt),
+			},
+			Message: "",
+		}
+	}
+
+	// Build the output
+	output := &keystoreV4{
+		KDF: kdf,
+		Checksum: &ksChecksum{
+			Function: "sha256",
+			Params:   make(map[string]interface{}),
+			Message:  hex.EncodeToString(checksumMsg),
+		},
+		Cipher: &ksCipher{
+			Function: "aes-128-ctr",
+			Params: &ksCipherParams{
+				IV: hex.EncodeToString(iv),
+			},
+			Message: hex.EncodeToString(cipherMsg),
+		},
+	}
+
+	// We need to return a generic map; go to JSON and back to obtain it
+	bytes, err := json.Marshal(output)
+	if err != nil {
+		return nil, err
+	}
+	res := make(map[string]interface{})
+	err = json.Unmarshal(bytes, &res)
+	if err != nil {
+		return nil, err
+	}
+
+	return res, nil
+}
